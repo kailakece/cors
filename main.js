@@ -2,7 +2,7 @@ Deno.serve(async (request) => {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // 1. Handle preflight request CORS (Wajib agar tidak diblokir browser)
+  // 1. Handle CORS Preflight OPTIONS
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -15,7 +15,7 @@ Deno.serve(async (request) => {
   }
 
   if (path === "/proxy") {
-    let targetUrl = url.searchParams.get("url");
+    const targetUrl = url.searchParams.get("url");
     const customReferer = url.searchParams.get("referer");
     const customUa = url.searchParams.get("ua");
 
@@ -23,19 +23,8 @@ Deno.serve(async (request) => {
       return new Response("Error: Parameter 'url' wajib diisi.", { status: 400 });
     }
 
-    // Kupas tuntas loop url akibat cache browser/player jika ada
-    while (targetUrl.includes("proxy?url=")) {
-      try {
-        const parts = targetUrl.split("url=");
-        targetUrl = decodeURIComponent(parts[parts.length - 1]).split("&")[0];
-      } catch (_e) {
-        break;
-      }
-    }
-    targetUrl = decodeURIComponent(targetUrl);
-
     try {
-      // 2. Duplikat header dari client dan bersihkan untuk server target
+      // 2. Siapkan Header Palsu untuk Target Server
       const newHeaders = new Headers(request.headers);
       try {
         newHeaders.set("Origin", new URL(targetUrl).origin);
@@ -43,21 +32,63 @@ Deno.serve(async (request) => {
         return new Response("Error: Format 'url' tidak valid.", { status: 400 });
       }
       
-      // Pasang Referer jika dikirim dari playlist
       if (customReferer) newHeaders.set("Referer", customReferer);
       else newHeaders.delete("Referer");
       
-      // Pasang User-Agent jika dikirim dari playlist
       if (customUa) newHeaders.set("User-Agent", customUa);
 
-      // 3. Tembak ke server target (RCTI / lainnya) membawa header palsu kita
+      // 3. Tembak ke Target Server
       const modifiedResponse = await fetch(targetUrl, {
         method: request.method,
         headers: newHeaders,
         redirect: "follow"
       });
 
-      // 4. Kirim balik DATA MURNI 100% tanpa diubah sedikitpun ke player
+      const contentType = modifiedResponse.headers.get("content-type") || "";
+      
+      // 4. JIKA FORMATNYA M3U8, BONGKAR DAN REWRITE LINK SEGMEN .TS NYA
+      if (contentType.includes("mpegurl") || contentType.includes("application/vnd.apple.mpegurl") || targetUrl.includes(".m3u8")) {
+        const m3u8Text = await modifiedResponse.text();
+        
+        // Ambil base URL orisinil untuk melengkapi segmen yang relatif
+        const baseOriginalUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
+        
+        const lines = m3u8Text.split("\n");
+        const modifiedLines = lines.map(line => {
+          // Jangan sentuh baris kosong atau baris tag info (#EXTINF, #EXT-X-KEY, dll)
+          if (line.trim() === "" || line.startsWith("#")) {
+            return line;
+          }
+          
+          // Satukan link jika aslinya berupa path relatif
+          let fullSegmentUrl = line;
+          if (!line.startsWith("http")) {
+            fullSegmentUrl = baseOriginalUrl + line;
+          }
+
+          // Bungkus rute segmen .ts ke proxy Deno ini lagi
+          const proxyParams = new URLSearchParams();
+          proxyParams.append('url', fullSegmentUrl);
+          if (customReferer) proxyParams.append('referer', customReferer);
+          if (customUa) proxyParams.append('ua', customUa);
+
+          return `${url.origin}${url.pathname}?${proxyParams.toString()}`;
+        });
+
+        const newM3u8Body = modifiedLines.join("\n");
+
+        return new Response(newM3u8Body, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/x-mpegURL",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+            "Access-Control-Allow-Headers": "*"
+          }
+        });
+      }
+
+      // 5. JIKA FORMATNYA NON-M3U8 (SEGMEN .TS / MPD / DIRECT VIDEO), ALIRKAN DATA MURNI
       const responseHeaders = new Headers(modifiedResponse.headers);
       responseHeaders.set("Access-Control-Allow-Origin", "*");
       responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
@@ -77,5 +108,7 @@ Deno.serve(async (request) => {
     }
   }
 
-  return new Response("Proxy Server Aktif.", { headers: { "Content-Type": "text/plain" } });
+  return new Response("Proxy Server Aktif. Gunakan format: /proxy?url=LINK_STREAMING", {
+    headers: { "Content-Type": "text/plain" }
+  });
 });
