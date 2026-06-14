@@ -2,7 +2,7 @@ Deno.serve(async (request) => {
   const url = new URL(request.url);
   const path = url.pathname;
 
-  // Handle preflight request CORS (Beberapa player melakukan cek OPTIONS terlebih dahulu)
+  // Handle preflight request CORS
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -45,7 +45,7 @@ Deno.serve(async (request) => {
       const contentType = modifiedResponse.headers.get("content-type") || "";
       
       // ==========================================
-      // 1. PENANGANAN UNTUK HLS (M3U8)
+      // 1. PENANGANAN UNTUK HLS (M3U8) - AMAN
       // ==========================================
       if (contentType.includes("mpegurl") || contentType.includes("application/vnd.apple.mpegurl") || targetUrl.includes(".m3u8")) {
         let m3u8Text = await modifiedResponse.text();
@@ -86,36 +86,30 @@ Deno.serve(async (request) => {
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
+        
+        // Dapatkan base URL dari manifest MPD asli
         const baseOriginalUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
+        // Bersihkan <BaseURL> bawaan asli (jika ada) agar tidak konflik relative path-nya
+        mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
+
+        // Susun parameter untuk diteruskan ke segmen video (.m4s / .mp4)
         const proxyParams = new URLSearchParams();
+        proxyParams.append('url', baseOriginalUrl); // Mengarahkan base segmen ke folder aslinya
         if (customReferer) proxyParams.append('referer', customReferer);
         if (customUa) proxyParams.append('ua', customUa);
 
-        // 1. Hapus SEMUA tag <BaseURL> bawaan asli agar tidak bentrok atau double
-        mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
-
-        // 2. Ubah URL absolut (http/https) hanya jika BUKAN mengarah ke proxy kita sendiri
-        const hrefRegex = /(https?:\/\/[^\s<"\']+)/g;
-        mpdText = mpdText.replace(hrefRegex, (match) => {
-          // Jika URL sudah mengandung domain proxy kita, biarkan saja (jangan diubah lagi agar tidak loop)
-          if (match.includes(url.hostname)) return match;
-          
-          const segmentParams = new URLSearchParams(proxyParams);
-          segmentParams.set('url', match);
-          return `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
-        });
-
-        // 3. Pasang satu <BaseURL> utama di paling atas untuk handle segmen relatif
-        const rawProxyBaseUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(baseOriginalUrl)}&${proxyParams.toString()}`;
-        const safeProxyBaseUrl = rawProxyBaseUrl.replace(/&/g, '&amp;');
+        // URL Proxy Base yang aman dengan meng-escape karakter '&' menjadi '&amp;' khusus untuk format XML (MPD)
+        const safeProxyBaseUrl = `${url.origin}${url.pathname}?${proxyParams.toString()}`.replace(/&/g, '&amp;');
         
+        // Suntikkan <BaseURL> proxy kita tepat di bawah tag <MPD ...>
+        // Dengan ini, semua segmen audio/video relatif otomatis akan memanggil proxy kamu + referer + ua
         mpdText = mpdText.replace(/(<MPD[^>]*>)/i, `$1\n  <BaseURL>${safeProxyBaseUrl}</BaseURL>`);
 
         return new Response(mpdText, {
           status: 200,
           headers: {
-            "Content-Type": contentType.includes("dash+xml") ? contentType : "application/dash+xml",
+            "Content-Type": "application/dash+xml",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
             "Access-Control-Allow-Headers": "*"
@@ -124,13 +118,14 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 3. SEGMEN VIDEO/AUDIO BIASA (.ts, .m4s, dll)
+      // 3. SEGMEN VIDEO/AUDIO BIASA (.ts, .m4s, .mp4, dll)
       // ==========================================
       const responseHeaders = new Headers(modifiedResponse.headers);
       responseHeaders.set("Access-Control-Allow-Origin", "*");
       responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
       responseHeaders.set("Access-Control-Allow-Headers", "*");
 
+      // Teruskan headers esensial yang mungkin dibutuhkan player (seperti Content-Range untuk seeking)
       return new Response(modifiedResponse.body, {
         status: modifiedResponse.status,
         statusText: modifiedResponse.statusText,
