@@ -24,14 +24,34 @@ Deno.serve(async (request) => {
     }
 
     // ==========================================
-    // KILL SWITCH: ANTI-LOOP PINTU MASUK
+    // SELESAI DENGAN PINTAR: AUTO-UNWRAP LOOP (SOLUSI SHAKA)
     // ==========================================
-    if (targetUrl.includes(url.hostname) || decodeURIComponent(targetUrl).includes(url.hostname)) {
-      return new Response("Error: Loop terdeteksi dan diblokir.", { 
-        status: 400,
-        headers: { "Access-Control-Allow-Origin": "*" }
-      });
+    // Jika Shaka Player mengirimkan URL bertumpuk ganda karena error internalnya,
+    // Kita kupas terus sampai bersih dan mendapatkan URL aslinya kembali.
+    let loopCounter = 0;
+    while ((targetUrl.includes(url.hostname) || decodeURIComponent(targetUrl).includes(url.hostname)) && loopCounter < 5) {
+      try {
+        // Bersihkan teks jika dalam bentuk ter-encode penuh
+        const checkUrlText = targetUrl.includes("http") ? targetUrl : decodeURIComponent(targetUrl);
+        const nestedUrl = new URL(checkUrlText.startsWith("http") ? checkUrlText : `http://${checkUrlText}`);
+        const extractedUrl = nestedUrl.searchParams.get("url");
+        
+        if (extractedUrl && extractedUrl !== targetUrl) {
+          targetUrl = extractedUrl;
+        } else {
+          // Jika tersangkut domain kita tanpa parameter 'url', bersihkan paksa stringnya
+          const cleanRegex = new RegExp(`https?:\/\/${url.hostname}\/proxy\\?url=`, "gi");
+          targetUrl = decodeURIComponent(targetUrl).replace(cleanRegex, "");
+          break;
+        }
+      } catch (_e) {
+        break;
+      }
+      loopCounter++;
     }
+
+    // Jaga-jaga jika hasil kupasan masih kotor
+    targetUrl = decodeURIComponent(targetUrl);
 
     try {
       const newHeaders = new Headers(request.headers);
@@ -99,7 +119,7 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN DASH (MPD) - FIX METHOD UNTUK SHAKA
+      // 2. PENANGANAN DASH (MPD) - ANTI-LOOP UNTUK SHAKA
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
@@ -109,31 +129,26 @@ Deno.serve(async (request) => {
         if (customReferer) proxyParams.append('referer', customReferer);
         if (customUa) proxyParams.append('ua', customUa);
 
-        // BUANG total tag <BaseURL> asli (jika ada) agar Shaka dipaksa membaca modifikasi kita
+        // Buang tag BaseURL bawaan agar tidak mengacaukan resolver Shaka
         mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
 
-        // UBAH semua link relatif (seperti media="segmen.m4s") menjadi absolut + proxy
-        // Regex mencari atribut media/initialization/sourceURL yang TIDAK diawali http
+        // Ganti semua path relatif menjadi absolut yang dibungkus proxy
         const relativeAttrRegex = /(href|sourceURL|initialization|media)="((?!https?:\/\/)[^"]+)"/gi;
-        
         mpdText = mpdText.replace(relativeAttrRegex, (match, attribute, relativeUrl) => {
           const fullSegmentUrl = baseOriginalUrl + relativeUrl;
-          
           const segmentParams = new URLSearchParams(proxyParams);
           segmentParams.set('url', fullSegmentUrl);
-          
           const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
           return `${attribute}="${finalProxyUrl}"`;
         });
 
-        // UBAH jika ada link yang dari awal sudah absolut di dalam manifest
+        // Ganti jika ada link absolut bawaan
         const absoluteAttrRegex = /(href|sourceURL|initialization|media)="((https?):\/\/[^"]+)"/gi;
         mpdText = mpdText.replace(absoluteAttrRegex, (match, attribute, fullUrl) => {
-          if (fullUrl.includes(url.hostname)) return match;
+          if (fullUrl.includes(url.hostname) || decodeURIComponent(fullUrl).includes(url.hostname)) return match;
           
           const segmentParams = new URLSearchParams(proxyParams);
           segmentParams.set('url', fullUrl);
-          
           const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
           return `${attribute}="${finalProxyUrl}"`;
         });
