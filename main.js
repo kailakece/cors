@@ -23,24 +23,16 @@ Deno.serve(async (request) => {
       return new Response("Error: Parameter 'url' wajib diisi.", { status: 400 });
     }
 
-    // ==========================================
-    // DEEP UNWRAP: Kupas Tuntas URL Numpuk dari Shaka
-    // ==========================================
-    let cleanUrl = targetUrl;
-    while (cleanUrl.includes("/proxy?")) {
+    // Kupas tuntas jika ada sisa loop lama dari cache browser/player
+    while (targetUrl.includes("proxy?url=")) {
       try {
-        // Ambil komponen setelah 'url=' terakhir
-        const searchPart = cleanUrl.split("url=").pop();
-        if (searchPart) {
-          cleanUrl = decodeURIComponent(searchPart).split("&")[0];
-        } else {
-          break;
-        }
+        const parts = targetUrl.split("url=");
+        targetUrl = decodeURIComponent(parts[parts.length - 1]).split("&")[0];
       } catch (_e) {
         break;
       }
     }
-    targetUrl = cleanUrl;
+    targetUrl = decodeURIComponent(targetUrl);
 
     try {
       const newHeaders = new Headers(request.headers);
@@ -71,8 +63,10 @@ Deno.serve(async (request) => {
       const contentType = modifiedResponse.headers.get("content-type") || "";
 
       // ==========================================
-      // 1. PENANGANAN UNIVERSAL UNTUK HLS (M3U8)
+      // 1. PENANGANAN WAJIB UNTUK HLS (M3U8)
       // ==========================================
+      // Kita tetap pertahankan ini karena Shaka Player butuh bantuan proxy 
+      // untuk mengurai baris path relatif pada struktur file .m3u8
       if (contentType.includes("mpegurl") || contentType.includes("application/vnd.apple.mpegurl") || targetUrl.includes(".m3u8")) {
         let m3u8Text = await modifiedResponse.text();
         const baseOriginalUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
@@ -108,42 +102,11 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN DASH (MPD) - METODE LOCATION (ANTI-POTONG / ANTI ERROR 3008)
+      // 2. PENANGANAN DASH (MPD) & SEGMEN VIDEO BIASA
       // ==========================================
-      if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
-        let mpdText = await modifiedResponse.text();
-        
-        // Buang BaseURL bawaan agar Shaka tidak bingung rutenya
-        mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
-
-        // Siapkan parameter proxy induk
-        const proxyParams = new URLSearchParams();
-        proxyParams.append('url', targetUrl);
-        if (customReferer) proxyParams.append('referer', customReferer);
-        if (customUa) proxyParams.append('ua', customUa);
-
-        const safeProxyLocationUrl = `${url.origin}${url.pathname}?${proxyParams.toString()}`.replace(/&/g, '&amp;');
-
-        // Suntikkan tag <Location> tepat di bawah elemen <MPD> utama
-        // Tanpa mengubah isi data XML lainnya sedikit pun! (Menghindari resiko terpotong)
-        if (!mpdText.includes("<Location>")) {
-          mpdText = mpdText.replace(/(<MPD[^>]*>)/i, `$1\n  <Location>${safeProxyLocationUrl}</Location>`);
-        }
-
-        return new Response(mpdText, {
-          status: 200,
-          headers: {
-            "Content-Type": "application/dash+xml",
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*"
-          }
-        });
-      }
-
-      // ==========================================
-      // 3. SEGMEN VIDEO/AUDIO (.ts, .m4s, .mp4, dll)
-      // ==========================================
+      // Untuk DASH (.mpd), kita kembalikan data mentah aslinya secara utuh 100%. 
+      // Mengapa? Karena urusan pembungkusan segmen DASH sudah ditangani dengan sangat cerdas 
+      // oleh skrip "Request Filter" baru yang kita pasang di sisi player kamu tadi.
       const responseHeaders = new Headers(modifiedResponse.headers);
       responseHeaders.set("Access-Control-Allow-Origin", "*");
       responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
