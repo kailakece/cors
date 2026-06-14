@@ -1,3 +1,6 @@
+// Variabel global untuk mengingat folder manifest terakhir yang di-request secara dinamis
+let LAST_STREAM_BASE_URL = "https://storage.googleapis.com/shaka-demo-assets/angel-one/";
+
 Deno.serve(async (request) => {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -19,11 +22,19 @@ Deno.serve(async (request) => {
     const customReferer = url.searchParams.get("referer");
     const customUa = url.searchParams.get("ua");
 
+    // ==========================================
+    // JARING PENGAMAN UNIVERSAL 1: JIKA SEGMEN MASUK TANPA ?url= DI JALUR /proxy
+    // ==========================================
     if (!targetUrl) {
-      return new Response("Error: Parameter 'url' wajib diisi.", { status: 400 });
+      const fallbackFile = path.replace("/", "");
+      if (fallbackFile && fallbackFile !== "proxy") {
+        targetUrl = `${LAST_STREAM_BASE_URL}${fallbackFile}`;
+      } else {
+        return new Response("Error: Parameter 'url' tidak ditemukan.", { status: 400 });
+      }
     }
 
-    // Kupas tuntas jika ada sisa loop lama dari cache browser/player
+    // Kupas tuntas jika ada sisa loop bersarai akibat cache player
     while (targetUrl.includes("proxy?url=")) {
       try {
         const parts = targetUrl.split("url=");
@@ -33,6 +44,11 @@ Deno.serve(async (request) => {
       }
     }
     targetUrl = decodeURIComponent(targetUrl);
+
+    // OTOMATIS REKAM BASE URL UTAMA (Mendukung Multi-Link Secara Dinamis)
+    if (targetUrl.includes(".mpd") || targetUrl.includes(".m3u8")) {
+      LAST_STREAM_BASE_URL = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
+    }
 
     try {
       const newHeaders = new Headers(request.headers);
@@ -63,10 +79,8 @@ Deno.serve(async (request) => {
       const contentType = modifiedResponse.headers.get("content-type") || "";
 
       // ==========================================
-      // 1. PENANGANAN WAJIB UNTUK HLS (M3U8)
+      // PENANGANAN UNTUK HLS (M3U8) - UNTUK VIDEO.JS
       // ==========================================
-      // Kita tetap pertahankan ini karena Shaka Player butuh bantuan proxy 
-      // untuk mengurai baris path relatif pada struktur file .m3u8
       if (contentType.includes("mpegurl") || contentType.includes("application/vnd.apple.mpegurl") || targetUrl.includes(".m3u8")) {
         let m3u8Text = await modifiedResponse.text();
         const baseOriginalUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
@@ -102,11 +116,8 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN DASH (MPD) & SEGMEN VIDEO BIASA
+      // PENANGANAN DASH (.MPD) VIA SHAKA & SEGMEN VIDEO MURNI (.webm, .mp4, .m4s)
       // ==========================================
-      // Untuk DASH (.mpd), kita kembalikan data mentah aslinya secara utuh 100%. 
-      // Mengapa? Karena urusan pembungkusan segmen DASH sudah ditangani dengan sangat cerdas 
-      // oleh skrip "Request Filter" baru yang kita pasang di sisi player kamu tadi.
       const responseHeaders = new Headers(modifiedResponse.headers);
       responseHeaders.set("Access-Control-Allow-Origin", "*");
       responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
@@ -123,6 +134,26 @@ Deno.serve(async (request) => {
         status: 500,
         headers: { "Access-Control-Allow-Origin": "*" }
       });
+    }
+  }
+
+  // ==========================================
+  // JARING PENGAMAN UNIVERSAL 2: JIKA REKUEST SEGMEN MASUK KE ROOT UTAMA (Bukan /proxy)
+  // ==========================================
+  const cleanPathFile = path.replace("/", "");
+  if (cleanPathFile && cleanPathFile !== "proxy") {
+    const fallbackTarget = `${LAST_STREAM_BASE_URL}${cleanPathFile}`;
+    try {
+      const fallbackResponse = await fetch(fallbackTarget, { redirect: "follow" });
+      const fallbackHeaders = new Headers(fallbackResponse.headers);
+      fallbackHeaders.set("Access-Control-Allow-Origin", "*");
+      
+      return new Response(fallbackResponse.body, {
+        status: fallbackResponse.status,
+        headers: fallbackHeaders
+      });
+    } catch (_err) {
+      return new Response("File segmen tidak valid.", { status: 404 });
     }
   }
 
