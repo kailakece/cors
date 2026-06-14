@@ -24,10 +24,8 @@ Deno.serve(async (request) => {
     }
 
     // ==========================================
-    // ANTIDOTE LEVEL 0: DETEKSI & UNWRAP DOUBLE PROXY DI PINTU MASUK
+    // ANTIDOTE: DETEKSI & UNWRAP DOUBLE PROXY
     // ==========================================
-    // Jika targetUrl ternyata masih mengandung domain proxy kita sendiri, 
-    // kita bongkar (unwrap) secara paksa sampai mendapatkan URL aslinya.
     while (targetUrl.includes(url.hostname) && targetUrl.includes("url=")) {
       try {
         const nestedUrl = new URL(targetUrl);
@@ -42,9 +40,13 @@ Deno.serve(async (request) => {
       }
     }
 
-    // Proteksi terakhir: Jika setelah dibongkar tetap mengarah ke diri sendiri tanpa parameter, cut!
     if (targetUrl.includes(url.hostname)) {
       return new Response("Error: Loop terdeteksi pada pintu masuk proxy.", { status: 400 });
+    }
+
+    // Bypass jika player tidak sengaja meminta root folder kosong agar tidak 404
+    if (targetUrl.endsWith("/") && !targetUrl.includes(".mpd") && !targetUrl.includes(".m3u8")) {
+      return new Response(null, { status: 204 });
     }
 
     try {
@@ -63,13 +65,18 @@ Deno.serve(async (request) => {
       const modifiedResponse = await fetch(targetUrl, {
         method: request.method,
         headers: newHeaders,
-        redirect: "follow" // Deno akan mengikuti redirect otomatis dari server target
+        redirect: "follow"
       });
+
+      // Tangani jika link video aslinya memang mati (404) dari server sana
+      if (modifiedResponse.status === 404) {
+        return new Response("Konten tidak ditemukan di server target (404).", { status: 404 });
+      }
 
       const contentType = modifiedResponse.headers.get("content-type") || "";
       
       // ==========================================
-      // 1. PENANGANAN UNTUK HLS (M3U8)
+      // 1. PENANGANAN UNIVERSAL UNTUK HLS (M3U8)
       // ==========================================
       if (contentType.includes("mpegurl") || contentType.includes("application/vnd.apple.mpegurl") || targetUrl.includes(".m3u8")) {
         let m3u8Text = await modifiedResponse.text();
@@ -106,7 +113,7 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN UNTUK DASH (MPD)
+      // 2. PENANGANAN UNIVERSAL UNTUK DASH (MPD)
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
@@ -116,22 +123,21 @@ Deno.serve(async (request) => {
         if (customReferer) proxyParams.append('referer', customReferer);
         if (customUa) proxyParams.append('ua', customUa);
 
-        // Hapus BaseURL asli bawaan manifest
+        // Hapus BaseURL bawaan lama agar tidak terjadi penumpukan path ganda
         mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
 
-        // Modifikasi atribut URL media asli yang ada di dalam manifest (Kecuali skema XML)
+        // Modifikasi URL Absolut di dalam manifest (jika ada) tanpa merusak skema XML asli
         const mediaUrlRegex = /(href|sourceURL|initialization|media|Location)="((https?):\/\/[^"]+)"/gi;
         mpdText = mpdText.replace(mediaUrlRegex, (match, attribute, fullUrl) => {
-          if (fullUrl.includes(url.hostname)) {
-            return match;
-          }
+          if (fullUrl.includes(url.hostname)) return match;
+          
           const segmentParams = new URLSearchParams(proxyParams);
           segmentParams.set('url', fullUrl);
           const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
           return `${attribute}="${finalProxyUrl}"`;
         });
 
-        // Pasang satu BaseURL proxy di paling atas untuk menangani segmen relatif
+        // Trik Otomatis: Inject BaseURL Proxy baru menyesuaikan folder asal link MPD masing-masing
         const rawProxyBaseUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(baseOriginalUrl)}&${proxyParams.toString()}`;
         const safeProxyBaseUrl = rawProxyBaseUrl.replace(/&/g, '&amp;');
         
@@ -149,7 +155,7 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 3. SEGMEN VIDEO/AUDIO BIASA (.ts, .m4s, .mp4, dll)
+      // 3. SEGMEN VIDEO/AUDIO (.ts, .m4s, .mp4, dll)
       // ==========================================
       const responseHeaders = new Headers(modifiedResponse.headers);
       responseHeaders.set("Access-Control-Allow-Origin", "*");
@@ -167,7 +173,5 @@ Deno.serve(async (request) => {
     }
   }
 
-  return new Response("Proxy Server Aktif. Gunakan format: /proxy?url=LINK_STREAMING&referer=REFERER&ua=USER_AGENT", {
-    headers: { "Content-Type": "text/plain" }
-  });
+  return new Response("Proxy Server Aktif.", { headers: { "Content-Type": "text/plain" } });
 });
