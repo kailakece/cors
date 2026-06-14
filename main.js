@@ -16,30 +16,26 @@ Deno.serve(async (request) => {
 
   if (path === "/proxy") {
     let targetUrl = url.searchParams.get("url");
-    const customReferer = url.searchParams.get("referer");
-    const customUa = url.searchParams.get("ua");
+    let customReferer = url.searchParams.get("referer");
+    let customUa = url.searchParams.get("ua");
+    const headerData = url.searchParams.get("hdata"); // Mengambil data terenkripsi Base64
 
     if (!targetUrl) {
       return new Response("Error: Parameter 'url' wajib diisi.", { status: 400 });
     }
 
     // ==========================================
-    // SELESAI DENGAN PINTAR: AUTO-UNWRAP LOOP (SOLUSI SHAKA)
+    // 1. AUTO-UNWRAP LOOP (PERTAHANAN LEVEL UTAMA)
     // ==========================================
-    // Jika Shaka Player mengirimkan URL bertumpuk ganda karena error internalnya,
-    // Kita kupas terus sampai bersih dan mendapatkan URL aslinya kembali.
     let loopCounter = 0;
     while ((targetUrl.includes(url.hostname) || decodeURIComponent(targetUrl).includes(url.hostname)) && loopCounter < 5) {
       try {
-        // Bersihkan teks jika dalam bentuk ter-encode penuh
         const checkUrlText = targetUrl.includes("http") ? targetUrl : decodeURIComponent(targetUrl);
         const nestedUrl = new URL(checkUrlText.startsWith("http") ? checkUrlText : `http://${checkUrlText}`);
         const extractedUrl = nestedUrl.searchParams.get("url");
-        
         if (extractedUrl && extractedUrl !== targetUrl) {
           targetUrl = extractedUrl;
         } else {
-          // Jika tersangkut domain kita tanpa parameter 'url', bersihkan paksa stringnya
           const cleanRegex = new RegExp(`https?:\/\/${url.hostname}\/proxy\\?url=`, "gi");
           targetUrl = decodeURIComponent(targetUrl).replace(cleanRegex, "");
           break;
@@ -49,9 +45,21 @@ Deno.serve(async (request) => {
       }
       loopCounter++;
     }
-
-    // Jaga-jaga jika hasil kupasan masih kotor
     targetUrl = decodeURIComponent(targetUrl);
+
+    // ==========================================
+    // 2. DECODE DATA REFERER & UA DARI BASE64
+    // ==========================================
+    if (headerData) {
+      try {
+        const decodedText = atob(headerData);
+        const parsedHeaders = JSON.parse(decodedText);
+        if (parsedHeaders.referer) customReferer = parsedHeaders.referer;
+        if (parsedHeaders.ua) customUa = parsedHeaders.ua;
+      } catch (_e) {
+        // Abaikan jika gagal decode
+      }
+    }
 
     try {
       const newHeaders = new Headers(request.headers);
@@ -81,8 +89,14 @@ Deno.serve(async (request) => {
 
       const contentType = modifiedResponse.headers.get("content-type") || "";
       
+      // Bungkus data referer dan UA menjadi string Base64 yang aman dari pencemaran XML Shaka
+      const tokenPayload = {};
+      if (customReferer) tokenPayload.referer = customReferer;
+      if (customUa) tokenPayload.ua = customUa;
+      const safeToken = btoa(JSON.stringify(tokenPayload));
+
       // ==========================================
-      // 1. PENANGANAN UNIVERSAL UNTUK HLS (M3U8)
+      // 3. PENANGANAN UNIVERSAL UNTUK HLS (M3U8)
       // ==========================================
       if (contentType.includes("mpegurl") || contentType.includes("application/vnd.apple.mpegurl") || targetUrl.includes(".m3u8")) {
         let m3u8Text = await modifiedResponse.text();
@@ -99,12 +113,7 @@ Deno.serve(async (request) => {
             fullSegmentUrl = baseOriginalUrl + line;
           }
 
-          const proxyParams = new URLSearchParams();
-          proxyParams.append('url', fullSegmentUrl);
-          if (customReferer) proxyParams.append('referer', customReferer);
-          if (customUa) proxyParams.append('ua', customUa);
-
-          return `${url.origin}${url.pathname}?${proxyParams.toString()}`;
+          return `${url.origin}${url.pathname}?url=${encodeURIComponent(fullSegmentUrl)}&hdata=${safeToken}`;
         });
 
         return new Response(modifiedLines.join("\n"), {
@@ -119,37 +128,28 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN DASH (MPD) - ANTI-LOOP UNTUK SHAKA
+      // 4. PENANGANAN DASH (MPD) - ANTI ERROR 3008 & 508
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
         const baseOriginalUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
-        const proxyParams = new URLSearchParams();
-        if (customReferer) proxyParams.append('referer', customReferer);
-        if (customUa) proxyParams.append('ua', customUa);
-
-        // Buang tag BaseURL bawaan agar tidak mengacaukan resolver Shaka
+        // Bersihkan total tag BaseURL bawaan agar Shaka fokus pada manipulasi path kita
         mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
 
-        // Ganti semua path relatif menjadi absolut yang dibungkus proxy
+        // Ganti path RELATIF menjadi absolut + enkripsi hdata
         const relativeAttrRegex = /(href|sourceURL|initialization|media)="((?!https?:\/\/)[^"]+)"/gi;
         mpdText = mpdText.replace(relativeAttrRegex, (match, attribute, relativeUrl) => {
           const fullSegmentUrl = baseOriginalUrl + relativeUrl;
-          const segmentParams = new URLSearchParams(proxyParams);
-          segmentParams.set('url', fullSegmentUrl);
-          const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
+          const finalProxyUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(fullSegmentUrl)}&amp;hdata=${safeToken}`;
           return `${attribute}="${finalProxyUrl}"`;
         });
 
-        // Ganti jika ada link absolut bawaan
+        // Ganti path ABSOLUT bawaan menjadi proxy + enkripsi hdata
         const absoluteAttrRegex = /(href|sourceURL|initialization|media)="((https?):\/\/[^"]+)"/gi;
         mpdText = mpdText.replace(absoluteAttrRegex, (match, attribute, fullUrl) => {
           if (fullUrl.includes(url.hostname) || decodeURIComponent(fullUrl).includes(url.hostname)) return match;
-          
-          const segmentParams = new URLSearchParams(proxyParams);
-          segmentParams.set('url', fullUrl);
-          const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
+          const finalProxyUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(fullUrl)}&amp;hdata=${safeToken}`;
           return `${attribute}="${finalProxyUrl}"`;
         });
 
@@ -165,7 +165,7 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 3. SEGMEN VIDEO/AUDIO (.ts, .m4s, .mp4, dll)
+      // 5. SEGMEN VIDEO/AUDIO (.ts, .m4s, .mp4, dll)
       // ==========================================
       const responseHeaders = new Headers(modifiedResponse.headers);
       responseHeaders.set("Access-Control-Allow-Origin", "*");
