@@ -15,12 +15,36 @@ Deno.serve(async (request) => {
   }
 
   if (path === "/proxy") {
-    const targetUrl = url.searchParams.get("url");
+    let targetUrl = url.searchParams.get("url");
     const customReferer = url.searchParams.get("referer");
     const customUa = url.searchParams.get("ua");
 
     if (!targetUrl) {
       return new Response("Error: Parameter 'url' wajib diisi.", { status: 400 });
+    }
+
+    // ==========================================
+    // ANTIDOTE LEVEL 0: DETEKSI & UNWRAP DOUBLE PROXY DI PINTU MASUK
+    // ==========================================
+    // Jika targetUrl ternyata masih mengandung domain proxy kita sendiri, 
+    // kita bongkar (unwrap) secara paksa sampai mendapatkan URL aslinya.
+    while (targetUrl.includes(url.hostname) && targetUrl.includes("url=")) {
+      try {
+        const nestedUrl = new URL(targetUrl);
+        const extractedUrl = nestedUrl.searchParams.get("url");
+        if (extractedUrl && extractedUrl !== targetUrl) {
+          targetUrl = extractedUrl;
+        } else {
+          break;
+        }
+      } catch (_e) {
+        break;
+      }
+    }
+
+    // Proteksi terakhir: Jika setelah dibongkar tetap mengarah ke diri sendiri tanpa parameter, cut!
+    if (targetUrl.includes(url.hostname)) {
+      return new Response("Error: Loop terdeteksi pada pintu masuk proxy.", { status: 400 });
     }
 
     try {
@@ -39,13 +63,13 @@ Deno.serve(async (request) => {
       const modifiedResponse = await fetch(targetUrl, {
         method: request.method,
         headers: newHeaders,
-        redirect: "follow"
+        redirect: "follow" // Deno akan mengikuti redirect otomatis dari server target
       });
 
       const contentType = modifiedResponse.headers.get("content-type") || "";
       
       // ==========================================
-      // 1. PENANGANAN UNTUK HLS (M3U8) - AMAN
+      // 1. PENANGANAN UNTUK HLS (M3U8)
       // ==========================================
       if (contentType.includes("mpegurl") || contentType.includes("application/vnd.apple.mpegurl") || targetUrl.includes(".m3u8")) {
         let m3u8Text = await modifiedResponse.text();
@@ -82,40 +106,32 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN UNTUK DASH (MPD) - ANTI-LOOP FIXED (NO XML SKEMA CORRUPTION)
+      // 2. PENANGANAN UNTUK DASH (MPD)
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
         const baseOriginalUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
-        // 1. Parameter untuk diteruskan
         const proxyParams = new URLSearchParams();
         if (customReferer) proxyParams.append('referer', customReferer);
         if (customUa) proxyParams.append('ua', customUa);
 
-        // 2. Hapus BaseURL bawaan agar tidak konflik
+        // Hapus BaseURL asli bawaan manifest
         mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
 
-        // 3. REGEX BARU: Hanya ubah URL absolut yang ada di dalam tanda kutip atribut streaming biasa
-        // Ini menjamin URL xmlns skema w3.org TIDAK AKAN IKUT TERUBAH.
+        // Modifikasi atribut URL media asli yang ada di dalam manifest (Kecuali skema XML)
         const mediaUrlRegex = /(href|sourceURL|initialization|media|Location)="((https?):\/\/[^"]+)"/gi;
-        
         mpdText = mpdText.replace(mediaUrlRegex, (match, attribute, fullUrl) => {
-          const decodedUrl = decodeURIComponent(fullUrl);
-          
-          // Jika URL di dalam atribut sudah mengandung domain proxy kita, biarkan saja
-          if (decodedUrl.includes(url.hostname)) {
+          if (fullUrl.includes(url.hostname)) {
             return match;
           }
-          
           const segmentParams = new URLSearchParams(proxyParams);
           segmentParams.set('url', fullUrl);
-          
           const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
           return `${attribute}="${finalProxyUrl}"`;
         });
 
-        // 4. Inject BaseURL Proxy di bawah tag <MPD> untuk handle segmen relatif
+        // Pasang satu BaseURL proxy di paling atas untuk menangani segmen relatif
         const rawProxyBaseUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(baseOriginalUrl)}&${proxyParams.toString()}`;
         const safeProxyBaseUrl = rawProxyBaseUrl.replace(/&/g, '&amp;');
         
@@ -140,7 +156,6 @@ Deno.serve(async (request) => {
       responseHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
       responseHeaders.set("Access-Control-Allow-Headers", "*");
 
-      // Teruskan headers esensial yang mungkin dibutuhkan player (seperti Content-Range untuk seeking)
       return new Response(modifiedResponse.body, {
         status: modifiedResponse.status,
         statusText: modifiedResponse.statusText,
