@@ -82,28 +82,44 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN UNTUK DASH (MPD) - ANTI-LOOP FIXED!
+      // 2. PENANGANAN UNTUK DASH (MPD) - ANTI-LOOP ULTIMATE
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
-        
-        // Dapatkan base URL dari manifest MPD asli
         const baseOriginalUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
-        // Bersihkan <BaseURL> bawaan asli (jika ada) agar tidak konflik relative path-nya
-        mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
-
-        // Susun parameter untuk diteruskan ke segmen video (.m4s / .mp4)
+        // 1. Amankan parameter proxy utama
         const proxyParams = new URLSearchParams();
-        proxyParams.append('url', baseOriginalUrl); // Mengarahkan base segmen ke folder aslinya
         if (customReferer) proxyParams.append('referer', customReferer);
         if (customUa) proxyParams.append('ua', customUa);
 
-        // URL Proxy Base yang aman dengan meng-escape karakter '&' menjadi '&amp;' khusus untuk format XML (MPD)
-        const safeProxyBaseUrl = `${url.origin}${url.pathname}?${proxyParams.toString()}`.replace(/&/g, '&amp;');
+        // 2. Hapus BaseURL bawaan agar tidak merusak path relatif
+        mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
+
+        // 3. Modifikasi URL Absolut yang ada di dalam Manifest (Penyebab Loop jika salah re-encode)
+        // Regex ini mendeteksi semua URL http/https di dalam manifest
+        const hrefRegex = /(https?:\/\/[^\s<"\']+)/g;
+        mpdText = mpdText.replace(hrefRegex, (match) => {
+          // DECODE URL terlebih dahulu untuk memastikan tidak ada domain kita yang bersembunyi dalam bentuk %2F
+          const decodedMatch = decodeURIComponent(match);
+          
+          // JIKA URL sudah mengandung domain proxy kita (kailakece.deno.net), JANGAN diubah lagi!
+          if (decodedMatch.includes(url.hostname)) {
+            return match; 
+          }
+          
+          // Jika bukan domain kita, baru bungkus dengan proxy
+          const segmentParams = new URLSearchParams(proxyParams);
+          segmentParams.set('url', match);
+          
+          // Return URL proxy baru dan escape '&' menjadi '&amp;' untuk XML standar
+          return `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
+        });
+
+        // 4. Inject BaseURL Proxy untuk menangani segmen yang jalurnya relatif
+        const rawProxyBaseUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(baseOriginalUrl)}&${proxyParams.toString()}`;
+        const safeProxyBaseUrl = rawProxyBaseUrl.replace(/&/g, '&amp;');
         
-        // Suntikkan <BaseURL> proxy kita tepat di bawah tag <MPD ...>
-        // Dengan ini, semua segmen audio/video relatif otomatis akan memanggil proxy kamu + referer + ua
         mpdText = mpdText.replace(/(<MPD[^>]*>)/i, `$1\n  <BaseURL>${safeProxyBaseUrl}</BaseURL>`);
 
         return new Response(mpdText, {
