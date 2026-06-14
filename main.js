@@ -24,29 +24,13 @@ Deno.serve(async (request) => {
     }
 
     // ==========================================
-    // ANTIDOTE: DETEKSI & UNWRAP DOUBLE PROXY
+    // KILL SWITCH: ANTI-LOOP PINTU MASUK
     // ==========================================
-    while (targetUrl.includes(url.hostname) && targetUrl.includes("url=")) {
-      try {
-        const nestedUrl = new URL(targetUrl);
-        const extractedUrl = nestedUrl.searchParams.get("url");
-        if (extractedUrl && extractedUrl !== targetUrl) {
-          targetUrl = extractedUrl;
-        } else {
-          break;
-        }
-      } catch (_e) {
-        break;
-      }
-    }
-
-    if (targetUrl.includes(url.hostname)) {
-      return new Response("Error: Loop terdeteksi pada pintu masuk proxy.", { status: 400 });
-    }
-
-    // Bypass jika player tidak sengaja meminta root folder kosong agar tidak 404
-    if (targetUrl.endsWith("/") && !targetUrl.includes(".mpd") && !targetUrl.includes(".m3u8")) {
-      return new Response(null, { status: 204 });
+    if (targetUrl.includes(url.hostname) || decodeURIComponent(targetUrl).includes(url.hostname)) {
+      return new Response("Error: Loop terdeteksi dan diblokir.", { 
+        status: 400,
+        headers: { "Access-Control-Allow-Origin": "*" }
+      });
     }
 
     try {
@@ -68,9 +52,11 @@ Deno.serve(async (request) => {
         redirect: "follow"
       });
 
-      // Tangani jika link video aslinya memang mati (404) dari server sana
       if (modifiedResponse.status === 404) {
-        return new Response("Konten tidak ditemukan di server target (404).", { status: 404 });
+        return new Response("404 Not Found di server target.", { 
+          status: 404,
+          headers: { "Access-Control-Allow-Origin": "*" }
+        });
       }
 
       const contentType = modifiedResponse.headers.get("content-type") || "";
@@ -113,7 +99,7 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN UNIVERSAL UNTUK DASH (MPD)
+      // 2. PENANGANAN DASH (MPD) - FIX METHOD UNTUK SHAKA
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
@@ -123,25 +109,34 @@ Deno.serve(async (request) => {
         if (customReferer) proxyParams.append('referer', customReferer);
         if (customUa) proxyParams.append('ua', customUa);
 
-        // Hapus BaseURL bawaan lama agar tidak terjadi penumpukan path ganda
+        // BUANG total tag <BaseURL> asli (jika ada) agar Shaka dipaksa membaca modifikasi kita
         mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
 
-        // Modifikasi URL Absolut di dalam manifest (jika ada) tanpa merusak skema XML asli
-        const mediaUrlRegex = /(href|sourceURL|initialization|media|Location)="((https?):\/\/[^"]+)"/gi;
-        mpdText = mpdText.replace(mediaUrlRegex, (match, attribute, fullUrl) => {
-          if (fullUrl.includes(url.hostname)) return match;
+        // UBAH semua link relatif (seperti media="segmen.m4s") menjadi absolut + proxy
+        // Regex mencari atribut media/initialization/sourceURL yang TIDAK diawali http
+        const relativeAttrRegex = /(href|sourceURL|initialization|media)="((?!https?:\/\/)[^"]+)"/gi;
+        
+        mpdText = mpdText.replace(relativeAttrRegex, (match, attribute, relativeUrl) => {
+          const fullSegmentUrl = baseOriginalUrl + relativeUrl;
           
           const segmentParams = new URLSearchParams(proxyParams);
-          segmentParams.set('url', fullUrl);
+          segmentParams.set('url', fullSegmentUrl);
+          
           const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
           return `${attribute}="${finalProxyUrl}"`;
         });
 
-        // Trik Otomatis: Inject BaseURL Proxy baru menyesuaikan folder asal link MPD masing-masing
-        const rawProxyBaseUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(baseOriginalUrl)}&${proxyParams.toString()}`;
-        const safeProxyBaseUrl = rawProxyBaseUrl.replace(/&/g, '&amp;');
-        
-        mpdText = mpdText.replace(/(<MPD[^>]*>)/i, `$1\n  <BaseURL>${safeProxyBaseUrl}</BaseURL>`);
+        // UBAH jika ada link yang dari awal sudah absolut di dalam manifest
+        const absoluteAttrRegex = /(href|sourceURL|initialization|media)="((https?):\/\/[^"]+)"/gi;
+        mpdText = mpdText.replace(absoluteAttrRegex, (match, attribute, fullUrl) => {
+          if (fullUrl.includes(url.hostname)) return match;
+          
+          const segmentParams = new URLSearchParams(proxyParams);
+          segmentParams.set('url', fullUrl);
+          
+          const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
+          return `${attribute}="${finalProxyUrl}"`;
+        });
 
         return new Response(mpdText, {
           status: 200,
@@ -169,7 +164,10 @@ Deno.serve(async (request) => {
       });
 
     } catch (err) {
-      return new Response("Terjadi kesalahan proxy: " + err.message, { status: 500 });
+      return new Response("Terjadi kesalahan proxy: " + err.message, { 
+        status: 500,
+        headers: { "Access-Control-Allow-Origin": "*" }
+      });
     }
   }
 
