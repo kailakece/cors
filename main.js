@@ -82,41 +82,40 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN UNTUK DASH (MPD) - ANTI-LOOP ULTIMATE
+      // 2. PENANGANAN UNTUK DASH (MPD) - ANTI-LOOP FIXED (NO XML SKEMA CORRUPTION)
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
         const baseOriginalUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
 
-        // 1. Amankan parameter proxy utama
+        // 1. Parameter untuk diteruskan
         const proxyParams = new URLSearchParams();
         if (customReferer) proxyParams.append('referer', customReferer);
         if (customUa) proxyParams.append('ua', customUa);
 
-        // 2. Hapus BaseURL bawaan agar tidak merusak path relatif
+        // 2. Hapus BaseURL bawaan agar tidak konflik
         mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
 
-        // 3. Modifikasi URL Absolut yang ada di dalam Manifest (Penyebab Loop jika salah re-encode)
-        // Regex ini mendeteksi semua URL http/https di dalam manifest
-        const hrefRegex = /(https?:\/\/[^\s<"\']+)/g;
-        mpdText = mpdText.replace(hrefRegex, (match) => {
-          // DECODE URL terlebih dahulu untuk memastikan tidak ada domain kita yang bersembunyi dalam bentuk %2F
-          const decodedMatch = decodeURIComponent(match);
+        // 3. REGEX BARU: Hanya ubah URL absolut yang ada di dalam tanda kutip atribut streaming biasa
+        // Ini menjamin URL xmlns skema w3.org TIDAK AKAN IKUT TERUBAH.
+        const mediaUrlRegex = /(href|sourceURL|initialization|media|Location)="((https?):\/\/[^"]+)"/gi;
+        
+        mpdText = mpdText.replace(mediaUrlRegex, (match, attribute, fullUrl) => {
+          const decodedUrl = decodeURIComponent(fullUrl);
           
-          // JIKA URL sudah mengandung domain proxy kita (kailakece.deno.net), JANGAN diubah lagi!
-          if (decodedMatch.includes(url.hostname)) {
-            return match; 
+          // Jika URL di dalam atribut sudah mengandung domain proxy kita, biarkan saja
+          if (decodedUrl.includes(url.hostname)) {
+            return match;
           }
           
-          // Jika bukan domain kita, baru bungkus dengan proxy
           const segmentParams = new URLSearchParams(proxyParams);
-          segmentParams.set('url', match);
+          segmentParams.set('url', fullUrl);
           
-          // Return URL proxy baru dan escape '&' menjadi '&amp;' untuk XML standar
-          return `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
+          const finalProxyUrl = `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
+          return `${attribute}="${finalProxyUrl}"`;
         });
 
-        // 4. Inject BaseURL Proxy untuk menangani segmen yang jalurnya relatif
+        // 4. Inject BaseURL Proxy di bawah tag <MPD> untuk handle segmen relatif
         const rawProxyBaseUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(baseOriginalUrl)}&${proxyParams.toString()}`;
         const safeProxyBaseUrl = rawProxyBaseUrl.replace(/&/g, '&amp;');
         
