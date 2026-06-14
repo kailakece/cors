@@ -82,7 +82,7 @@ Deno.serve(async (request) => {
       }
 
       // ==========================================
-      // 2. PENANGANAN UNTUK DASH (MPD) - FIXED!
+      // 2. PENANGANAN UNTUK DASH (MPD) - ANTI-LOOP FIXED!
       // ==========================================
       if (contentType.includes("dash+xml") || contentType.includes("video/vnd.mpeg.dash.mpd") || targetUrl.includes(".mpd")) {
         let mpdText = await modifiedResponse.text();
@@ -92,20 +92,21 @@ Deno.serve(async (request) => {
         if (customReferer) proxyParams.append('referer', customReferer);
         if (customUa) proxyParams.append('ua', customUa);
 
-        // Hapus <BaseURL> bawaan server asli agar tidak bentrok dengan inject proxy kita
+        // 1. Hapus SEMUA tag <BaseURL> bawaan asli agar tidak bentrok atau double
         mpdText = mpdText.replace(/<BaseURL>[\s\S]*?<\/BaseURL>/gi, '');
 
-        // Tulis ulang URL absolut di dalam MPD agar lewat proxy (Output disanitasi &amp;)
+        // 2. Ubah URL absolut (http/https) hanya jika BUKAN mengarah ke proxy kita sendiri
         const hrefRegex = /(https?:\/\/[^\s<"\']+)/g;
         mpdText = mpdText.replace(hrefRegex, (match) => {
-          if (match.startsWith(url.origin)) return match;
+          // Jika URL sudah mengandung domain proxy kita, biarkan saja (jangan diubah lagi agar tidak loop)
+          if (match.includes(url.hostname)) return match;
           
           const segmentParams = new URLSearchParams(proxyParams);
           segmentParams.set('url', match);
           return `${url.origin}${url.pathname}?${segmentParams.toString()}`.replace(/&/g, '&amp;');
         });
 
-        // Pasang <BaseURL> milik proxy di baris teratas untuk menangani semua URL relatif segmen
+        // 3. Pasang satu <BaseURL> utama di paling atas untuk handle segmen relatif
         const rawProxyBaseUrl = `${url.origin}${url.pathname}?url=${encodeURIComponent(baseOriginalUrl)}&${proxyParams.toString()}`;
         const safeProxyBaseUrl = rawProxyBaseUrl.replace(/&/g, '&amp;');
         
@@ -141,7 +142,7 @@ Deno.serve(async (request) => {
     }
   }
 
-  return new Response("Proxy Server Aktif. Gunakan format: /proxy?url=LINK_STREAMING", {
+  return new Response("Proxy Server Aktif. Gunakan format: /proxy?url=LINK_STREAMING&referer=REFERER&ua=USER_AGENT", {
     headers: { "Content-Type": "text/plain" }
   });
 });
